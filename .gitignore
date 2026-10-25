@@ -1,0 +1,13 @@
+.DS_Store
+build/
+dist/
+*.class
+*.ncm
+*.mp3
+*.flac
+*.wav
+*.m4a
+*.lrc
+*.log
+NCM转换结果/
+转换结果/
