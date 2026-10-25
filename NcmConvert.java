@@ -58,12 +58,15 @@ public class NcmConvert {
             stream[k]=(byte)box[(box[i]+box[j])&255];
         }
         int start=b.position();
-        if(!validStart(raw,start,stream)) {
+        // A recognizable but damaged stream must fail validation below. Never
+        // silently crop it by searching for a later frame that happens to work.
+        if(!audioMarker(raw,start,stream)) {
             int found=-1;
-            for(int pos=start+1;pos+42<raw.length && pos-start<=16*1024*1024;pos++) {
+            for(int pos=start+1;pos+4<=raw.length && pos-start<=16*1024*1024;pos++) {
                 int a=(raw[pos]^stream[0])&255,c=(raw[pos+1]^stream[1])&255;
                 if(!((a=='f' && c=='L' && (byte)(raw[pos+2]^stream[2])=='a' && (byte)(raw[pos+3]^stream[3])=='C') ||
-                     (a=='I' && c=='D' && (byte)(raw[pos+2]^stream[2])=='3'))) continue;
+                     (a=='I' && c=='D' && (byte)(raw[pos+2]^stream[2])=='3') ||
+                     (a==255 && (c&224)==224 && mp3Prefix(raw,pos,stream)))) continue;
                 if(validStart(raw,pos,stream)) {found=pos;break;}
             }
             if(found<0) throw new IOException("无法定位有效音频，可能是不支持的格式或文件损坏");
@@ -82,10 +85,10 @@ public class NcmConvert {
         } else throw new IOException("解码后未识别到MP3或FLAC，可能是新格式或损坏文件");
         Files.createDirectories(dir);
         String base=source.getFileName().toString().replaceFirst("(?i)\\.ncm$","");
-        Path target=dir.resolve(base+"."+format);
+        Path target=dir.resolve(outputName(base,"."+format));
         for(int i=2;Files.exists(target);i++) {
             if(sameAudio(target,audio)) return target;
-            target=dir.resolve(base+" ("+i+")."+format);
+            target=dir.resolve(outputName(base," ("+i+")."+format));
         }
         Path temp=Files.createTempFile(dir,".ncm-converting-",".tmp");
         try {
@@ -93,6 +96,32 @@ public class NcmConvert {
             Files.move(temp,target); // A concurrent destination is never replaced.
         } finally {Files.deleteIfExists(temp);}
         return target;
+    }
+    static String outputName(String base,String suffix) throws IOException {
+        if(base.isEmpty())base="audio";
+        int budget=255-suffix.getBytes("UTF-8").length,bytes=0,end=0;
+        while(end<base.length()) {
+            int cp=base.codePointAt(end),n=cp<=127?1:cp<=2047?2:cp<=65535?3:4;
+            if(bytes+n>budget)break;
+            bytes+=n;end+=Character.charCount(cp);
+        }
+        return base.substring(0,end)+suffix;
+    }
+    static int decodedHeader(byte[] raw,int pos,byte[] stream,int offset) {
+        int h=0;for(int i=0;i<4;i++)h=(h<<8)|((raw[pos+offset+i]^stream[(offset+i)&255])&255);return h;
+    }
+    static boolean audioMarker(byte[] raw,int pos,byte[] stream) {
+        if(pos<0 || pos+4>raw.length)return false;
+        int h=decodedHeader(raw,pos,stream,0);
+        return h==0x664c6143 || (h>>>8)==0x494433 || (h>>>21)==2047;
+    }
+    static boolean mp3Prefix(byte[] raw,int pos,byte[] stream) {
+        int n=mp3FrameLength(decodedHeader(raw,pos,stream,0));
+        if(n<4 || pos+n>raw.length)return false;
+        if(pos+n==raw.length)return true;
+        if(pos+n+4>raw.length)return false;
+        int next=decodedHeader(raw,pos,stream,n);
+        return mp3FrameLength(next)>0 || (next>>>8)==0x544147 || next==0x41504554 || (next>>>8)==0x494433;
     }
     static boolean sameAudio(Path p,byte[] audio) throws IOException {
         if(!Files.isRegularFile(p) || Files.size(p)!=audio.length) return false;
@@ -106,7 +135,7 @@ public class NcmConvert {
         }
     }
     static boolean validStart(byte[] raw,int pos,byte[] stream) {
-        if(pos+42>raw.length) return false;
+        if(pos+4>raw.length) return false;
         int a=(raw[pos]^stream[0])&255,c=(raw[pos+1]^stream[1])&255;
         boolean flac=a=='f' && c=='L' && (byte)(raw[pos+2]^stream[2])=='a' && (byte)(raw[pos+3]^stream[3])=='C';
         boolean mp3=(a=='I' && c=='D' && (byte)(raw[pos+2]^stream[2])=='3') || (a==255 && (c&224)==224);
@@ -114,18 +143,14 @@ public class NcmConvert {
         byte[] decoded=Arrays.copyOfRange(raw,pos,raw.length);
         for(int i=0;i<decoded.length;i++) decoded[i]^=stream[i&255];
         try {if(flac) validateFlac(decoded);else validateMp3(decoded);return true;}
-        catch(IOException e) {
-            // A structurally identified FLAC is decoded below so its integrity
-            // error can be reported accurately instead of as an unknown format.
-            return flac && (e.getMessage().startsWith("FLAC音频帧校验失败") || e.getMessage().startsWith("FLAC采样数不完整"));
-        }
+        catch(IOException e) {return false;}
     }
     static void validateFlac(byte[] a) throws IOException {
         if(a.length<46 || (a[4]&127)!=0 || a[5]!=0 || a[6]!=0 || a[7]!=34)
             throw new IOException("FLAC STREAMINFO头异常");
         long packed=0; for(int i=18;i<26;i++) packed=(packed<<8)|(a[i]&255);
         long hz=packed>>>44, samples=packed&0xfffffffffL;
-        if(hz<1 || hz>655350) throw new IOException("FLAC采样信息异常");
+        if(hz<1 || hz>1048575) throw new IOException("FLAC采样信息异常");
         int p=4;
         while(true) {
             if(p+4>a.length) throw new IOException("FLAC元数据不完整");
@@ -155,7 +180,7 @@ public class NcmConvert {
         try {
             if(p+6>=a.length || (a[p]&255)!=255 || (a[p+1]&254)!=248)return -1;
             int code=(a[p+2]>>>4)&15,sr=a[p+2]&15,channels=(a[p+3]>>>4)&15,bits=(a[p+3]>>>1)&7;
-            if(code==0 || sr==15 || channels>10 || bits==3 || bits==7 || (a[p+3]&1)!=0)return -1;
+            if(code==0 || sr==15 || channels>10 || bits==3 || (a[p+3]&1)!=0)return -1;
             int q=p+4,first=a[q++]&255,count=0;
             if(first>=128){int mask=128;while((first&mask)!=0){count++;mask>>>=1;}if(count<2 || count>7)return -1;for(int k=1;k<count;k++)if((a[q++]&192)!=128)return -1;}
             int block;
@@ -171,25 +196,73 @@ public class NcmConvert {
         }catch(IndexOutOfBoundsException e){return -1;}
     }
     static void validateMp3(byte[] a) throws IOException {
-        int p=0,frames=0;
-        if(a.length>=10 && a[0]=='I' && a[1]=='D' && a[2]=='3') {
-            int n=0; for(int i=6;i<10;i++) { if((a[i]&128)!=0) throw new IOException("ID3长度异常"); n=(n<<7)|(a[i]&127); }
-            p=10+n+((a[3]==4 && (a[5]&16)!=0)?10:0);
+        int p=0,frames=0,end=mp3AudioEnd(a);
+        while(p+10<=end && matches(a,p,"ID3")) {
+            // The tag size excludes its header and optional footer.
+            int nsize=0;for(int i=6;i<10;i++){if((a[p+i]&128)!=0)throw new IOException("ID3长度异常");nsize=(nsize<<7)|(a[p+i]&127);}
+            long next=(long)p+10+nsize+((a[p+3]==4 && (a[p+5]&16)!=0)?10:0);
+            if(next>end)throw new IOException("ID3标签不完整");
+            p=(int)next;
         }
-        int[][] rates={{0,32,40,48,56,64,80,96,112,128,160,192,224,256,320},
-                       {0,8,16,24,32,40,48,56,64,80,96,112,128,144,160}};
-        while(p+4<=a.length) {
-            if(a.length-p==128 && a[p]=='T' && a[p+1]=='A' && a[p+2]=='G') {p=a.length;break;}
+        while(p+4<=end) {
             int h=(a[p]&255)<<24|(a[p+1]&255)<<16|(a[p+2]&255)<<8|(a[p+3]&255);
-            int v=(h>>>19)&3,layer=(h>>>17)&3,r=(h>>>12)&15,s=(h>>>10)&3;
-            if((h>>>21)!=2047 || v==1 || layer!=1 || r==0 || r==15 || s==3)
-                throw new IOException("MP3音频帧异常，位置："+p);
-            int hz=new int[]{44100,48000,32000}[s]/(v==3?1:v==2?2:4);
-            int n=(v==3?144:72)*rates[v==3?0:1][r]*1000/hz+((h>>>9)&1);
-            if(p+n>a.length) throw new IOException("MP3音频帧不完整");
+            int n=mp3FrameLength(h);
+            if(n<0)throw new IOException("MP3音频帧异常，位置："+p);
+            if(p+n>end) throw new IOException("MP3音频帧不完整");
             p+=n;frames++;
         }
-        if(frames==0 || p!=a.length) throw new IOException("MP3音频完整性检查未通过");
+        if(frames==0 || p!=end) throw new IOException("MP3音频完整性检查未通过");
+    }
+    static final int[][] MP3_RATES={{0,32,40,48,56,64,80,96,112,128,160,192,224,256,320},
+                                   {0,8,16,24,32,40,48,56,64,80,96,112,128,144,160}};
+    static int mp3FrameLength(int h) {
+        int v=(h>>>19)&3,layer=(h>>>17)&3,r=(h>>>12)&15,s=(h>>>10)&3;
+        if((h>>>21)!=2047 || v==1 || layer!=1 || r==0 || r==15 || s==3)return -1;
+        int hz=new int[]{44100,48000,32000}[s]/(v==3?1:v==2?2:4);
+        return (v==3?144:72)*MP3_RATES[v==3?0:1][r]*1000/hz+((h>>>9)&1);
+    }
+    static boolean matches(byte[] a,int p,String marker) {
+        if(p<0 || p+marker.length()>a.length)return false;
+        for(int i=0;i<marker.length();i++)if((a[p+i]&255)!=marker.charAt(i))return false;
+        return true;
+    }
+    static long unsignedLE(byte[] a,int p) {return ByteBuffer.wrap(a,p,4).order(ByteOrder.LITTLE_ENDIAN).getInt()&0xffffffffL;}
+    static int mp3AudioEnd(byte[] a) throws IOException {
+        int end=a.length;
+        for(int count=0;count<8;count++) {
+            if(end>=128 && matches(a,end-128,"TAG")){end-=128;continue;}
+            if(end>=32 && matches(a,end-32,"APETAGEX")) {
+                int footer=end-32;long version=unsignedLE(a,footer+8),size=unsignedLE(a,footer+12),items=unsignedLE(a,footer+16),flags=unsignedLE(a,footer+20);
+                if((version!=1000 && version!=2000) || size<32 || size>end || (flags&0x20000000L)!=0 || items>(size-32)/10)
+                    throw new IOException("APE标签长度异常");
+                int start=(int)(end-size),q=start;
+                for(long item=0;item<items;item++) {
+                    if(q+8>footer)throw new IOException("APE标签项目不完整");
+                    long length=unsignedLE(a,q);q+=8;
+                    int key=q;while(q<footer && a[q]!=0)q++;
+                    if(q==key || q>=footer || length>footer-q-1)throw new IOException("APE标签项目长度异常");
+                    q+=(int)length+1;
+                }
+                if(q!=footer)throw new IOException("APE标签长度不匹配");
+                if((flags&0x80000000L)!=0) {
+                    if(start<32 || !matches(a,start-32,"APETAGEX") || unsignedLE(a,start-20)!=size)
+                        throw new IOException("APE标签头不完整");
+                    start-=32;
+                }
+                end=start;continue;
+            }
+            if(end>=20 && matches(a,end-10,"3DI")) {
+                int footer=end-10,size=0;
+                for(int i=6;i<10;i++){if((a[footer+i]&128)!=0)throw new IOException("ID3尾标签长度异常");size=(size<<7)|(a[footer+i]&127);}
+                int start=end-20-size;
+                if(start<0 || !matches(a,start,"ID3") || a[start+3]!=4 || (a[start+5]&16)==0)
+                    throw new IOException("ID3尾标签不完整");
+                for(int i=3;i<10;i++)if(a[start+i]!=a[footer+i])throw new IOException("ID3尾标签不匹配");
+                end=start;continue;
+            }
+            break;
+        }
+        return end;
     }
     public static void main(String[] args) throws Exception {
         if(args.length==0) {

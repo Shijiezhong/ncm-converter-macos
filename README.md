@@ -2,6 +2,10 @@
 
 一个轻量的 Mac 原生 NCM 音频转换工具。拖入文件或文件夹，批量还原其中的 **MP3 / FLAC**，保留原文件。
 
+**v2.1.0 界面更新：**统一青绿色配色，新增拖放区域、空列表引导、状态徽标和应用图标；成功结果支持双击定位，长路径保留在悬浮提示中。转换核心沿用 v2.0.2。
+
+**v2.0.2 兼容性修复：**修复 APE 标签 MP3、32 位 / 超高采样率 FLAC、超长文件名，以及没有 ID3 标签的 MP3 起点识别问题。[测试记录](TESTING.md)
+
 ## 下载与使用
 
 1. 在 [Releases](https://github.com/Shijiezhong/ncm-converter-macos/releases/latest) 下载应用 ZIP 并解压。

@@ -57,6 +57,31 @@ public class ConverterTest {
         return concat("CTENFDAM".getBytes("US-ASCII"),new byte[2],little(encodedKey.length),encodedKey,
             little(0),new byte[5],little(allocated),little(actual),new byte[allocated],prefix,encrypted);
     }
+    static byte[] extendedFlac(int bits,int rate)throws Exception {
+        byte[] info=new byte[34];ByteBuffer b=ByteBuffer.wrap(info);
+        b.putShort((short)192).putShort((short)192);b.position(10);
+        b.putLong(((long)rate<<44)|((long)(bits-1)<<36)|192);
+        b.put(MessageDigest.getInstance("MD5").digest(new byte[192*bits/8]));
+        byte[] head={(byte)255,(byte)248,0x10,(byte)(bits==32?14:8),0};
+        byte[] body=concat(head,new byte[]{(byte)crc(head,8,7)},new byte[1+bits/8]);
+        int crc16=crc(body,16,0x8005);
+        return concat(new byte[]{'f','L','a','C',(byte)128,0,0,34},info,body,new byte[]{(byte)(crc16>>8),(byte)crc16});
+    }
+    static byte[] ape(boolean header)throws Exception {
+        byte[] item=concat(little(3),little(0),"Title\0abc".getBytes("US-ASCII"));
+        int size=item.length+32;
+        ByteBuffer footer=ByteBuffer.allocate(32).order(ByteOrder.LITTLE_ENDIAN);
+        footer.put("APETAGEX".getBytes("US-ASCII")).putInt(2000).putInt(size).putInt(1).putInt(header?0x80000000:0);
+        if(!header)return concat(item,footer.array());
+        byte[] head=footer.array().clone();ByteBuffer.wrap(head).order(ByteOrder.LITTLE_ENDIAN).putInt(20,0xa0000000);
+        return concat(head,item,footer.array());
+    }
+    static void restores(Path root,byte[] audio,String name,int extra)throws Exception {
+        Path source=root.resolve(name+".ncm"),out=root.resolve("compatibility");
+        Files.write(source,ncm(audio,256,0,extra));
+        Path result=NcmConvert.convert(source,out);
+        check(Arrays.equals(audio,Files.readAllBytes(result)),name+" restores every original byte");
+    }
     static void rejects(Path root,byte[] contents,String label)throws Exception {
         Path source=root.resolve("bad-"+checks+".ncm"),out=root.resolve("reject-"+checks);
         Files.write(source,contents);
@@ -97,11 +122,44 @@ public class ConverterTest {
             byte[] invalidLength=ncm(mp3(false),0,0,0);
             Arrays.fill(invalidLength,10,14,(byte)0xff);
             rejects(root,invalidLength,"negative block length is rejected");
+            restores(root,concat(mp3(false),ape(false)),"MP3 with APEv2 footer",0);
+            restores(root,concat(mp3(false),ape(true)),"MP3 with APEv2 header and footer",0);
+            byte[] id3v1=new byte[128];id3v1[0]='T';id3v1[1]='A';id3v1[2]='G';
+            restores(root,concat(mp3(false),ape(true),id3v1),"MP3 with APEv2 and ID3v1",0);
+            byte[] tagHead={'I','D','3',4,0,16,0,0,0,0},tagFoot={'3','D','I',4,0,16,0,0,0,0};
+            restores(root,concat(mp3(false),tagHead,tagFoot),"MP3 with ID3v2.4 end tag",0);
+            restores(root,concat(tagHead,tagFoot,mp3(false)),"MP3 with ID3v2.4 leading footer",0);
+            restores(root,extendedFlac(32,44100),"32-bit FLAC",0);
+            restores(root,extendedFlac(16,768000),"768kHz FLAC",0);
+            restores(root,mp3(false),"No-ID3 MP3 after extra prefix",4096);
+            restores(root,mp3(true),"ID3 MP3 after extra prefix",4096);
+            String longName=String.join("",Collections.nCopies(251,"a"));
+            restores(root,flac(0),longName,0);
+            check(outputNamesFit(root.resolve("compatibility")),"long output names fit filesystem limits");
+            restores(root,flac(1),longName,0);
+            check(outputNamesFit(root.resolve("compatibility")),"long-name collision is safely numbered");
+            String unicodeName=String.join("",Collections.nCopies(80,"音"))+"🎵🎵";
+            restores(root,flac(0),unicodeName,0);restores(root,flac(1),unicodeName,0);
+            check(outputNamesFit(root.resolve("compatibility")),"Unicode filename truncation preserves code points");
+            byte[] brokenMiddle=concat(mp3(false),Arrays.copyOf(mp3(false),417));brokenMiddle[417]=0;
+            rejects(root,ncm(brokenMiddle,0,0,0),"damaged MP3 is never cropped into a partial success");
+            byte[] badApe=ape(false);Arrays.fill(badApe,badApe.length-20,badApe.length-16,(byte)255);
+            rejects(root,ncm(concat(mp3(false),badApe),0,0,0),"malformed APE tag is rejected");
+            rejects(root,ncm(concat(mp3(false),new byte[]{1,2,3,4}),0,0,0),"unrecognized trailing garbage is rejected");
             System.out.println("All "+checks+" checks passed. Fixtures are synthetic.");
         } finally {
             try(java.util.stream.Stream<Path> paths=Files.walk(root)){
                 for(Path p:(Iterable<Path>)paths.sorted(Comparator.reverseOrder())::iterator)Files.deleteIfExists(p);
             }
         }
+    }
+    static boolean outputNamesFit(Path dir)throws Exception {
+        try(java.util.stream.Stream<Path> paths=Files.list(dir)){
+            for(Path p:(Iterable<Path>)paths::iterator) {
+                String name=p.getFileName().toString();
+                if(name.getBytes("UTF-8").length>255 || name.indexOf('\ufffd')>=0)return false;
+            }
+        }
+        return true;
     }
 }
