@@ -1,0 +1,33 @@
+name: Test and build
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  java-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        java: ['8', '17', '21']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '${{ matrix.java }}'
+      - run: bash test.sh
+  macos-app:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - run: ARCH=universal bash build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macOS-universal-app
+          path: |
+            dist/*.zip
+            dist/ncm-converter.jar
+            dist/SHA256SUMS.txt
